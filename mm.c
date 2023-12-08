@@ -58,7 +58,7 @@
 /* Write a word at address p */
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 /* Write a ptr at address p */
-#define PUTPTR(p, ptr) (*(void **)(p) = (ptr))
+// #define PUTPTR(p, ptr) (*(void **)(p) = (ptr))
 
 /* Pack a size and allocated bit into a word */
 #define PACK(size, alloc) ((size) | (alloc))
@@ -79,10 +79,16 @@
 #define PREV_BLKP(bp)  ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
 /* Used in explicit free list */
-/* Given the free block ptr fbp, compute the ptr to the pred free block */
-#define PRED(fbp) ((void **)(fbp))
-/* Given the free block ptr fbp, compute the ptr to the succ free block */
-#define SUCC(fbp) ((void **)(fbp) + 1)
+/* Given free block ptr fbp, compute address of its pred-offset */
+#define PRED_OFFP(fbp) ((char *)(fbp))
+/* Given free block ptr fbp, compute address of its succ-offset */
+#define SUCC_OFFP(fbp) ((char *)(fbp) + WSIZE)
+/* Given free block ptr fbp, compute address of predecessor */
+#define PRED(fbp) ((char *)(fbp) + *(int *)(PRED_OFFP(fbp)))
+/* Given free block ptr fbp, compute address of successor */
+#define SUCC(fbp) ((char *)(fbp) + *(int *)(SUCC_OFFP(fbp)))
+/* Compute the offset from fbp1 to fbp2 */
+#define OFFSET(fbp1, fbp2) ((int)((char *)(fbp2) - (char *)(fbp1)))
 
 /* Global variables */
 /* ptr to prologue */
@@ -151,7 +157,7 @@ void *malloc(size_t size) {
     if (size == 0)
         return NULL;
     
-    size_t asize = MAX(ALIGN(size + DSIZE), 3*DSIZE); /* adjust block size */
+    size_t asize = MAX(ALIGN(size + DSIZE), 2*DSIZE); /* adjust block size */
     void *bp = find_fit(asize);
 
     if (bp != NULL) { /* found */
@@ -308,31 +314,31 @@ void mm_checkheap(int lineno) {
             dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
             exit(1);
         }
-        if (*SUCC(*PRED(ptr)) != ptr) {
+        if (SUCC(PRED(ptr)) != ptr) {
             dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
             exit(1);
         }
-        if (*PRED(*SUCC(ptr)) != ptr) {
+        if (PRED(SUCC(ptr)) != ptr) {
             dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
             exit(1);
         }
-        ptr = *SUCC(ptr);
+        ptr = SUCC(ptr);
         while (ptr != head) {
             ++cnt2;
             if (!in_heap(ptr)) {
                 dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
                 exit(1);
             }
-            if (*SUCC(*PRED(ptr)) != ptr) {
+            if (SUCC(PRED(ptr)) != ptr) {
                 dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
                 exit(1);
             }
-            if (*PRED(*SUCC(ptr)) != ptr) {
+            if (PRED(SUCC(ptr)) != ptr) {
                 dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
                 exit(1);
             }
 
-            ptr = *SUCC(ptr);
+            ptr = SUCC(ptr);
         }
     }
 
@@ -341,12 +347,12 @@ void mm_checkheap(int lineno) {
         dbg_printf("line %d: counts of fbs differ (%lu : %lu)\n", lineno, cnt1, cnt2);
 
         dbg_printf("\tlist[0] = %p (head)\n", head);
-        ptr = *SUCC(head);
+        ptr = SUCC(head);
         size_t i = 1;
         while (ptr != head) {
             dbg_printf("\tlist[%lu] = %p\n", i, ptr);
             ++i;
-            ptr = *SUCC(ptr);
+            ptr = SUCC(ptr);
         }
 
         exit(1);
@@ -420,11 +426,11 @@ static void *find_fit(size_t asize) {
 
     if (!GET_ALLOC(HDRP(head)) && asize <= GET_SIZE(HDRP(head)))
         return head;
-    void *fbp = *SUCC(head);
+    void *fbp = SUCC(head);
     while (fbp != head) {
         if (!GET_ALLOC(HDRP(fbp)) && asize <= GET_SIZE(HDRP(fbp)))
             return fbp;
-        fbp = *SUCC(fbp);
+        fbp = SUCC(fbp);
     }
 
     /* not found */
@@ -488,15 +494,15 @@ static void insert_fb(void *fbp) {
 
     if (head == NULL) {
         head = fbp;
-        PUTPTR(PRED(fbp), fbp);
-        PUTPTR(SUCC(fbp), fbp);
+        PUT(PRED_OFFP(fbp), 0);
+        PUT(SUCC_OFFP(fbp), 0);
 
     } else {
-        void *pred = *PRED(head), *succ = head;
-        PUTPTR(PRED(fbp), pred);
-        PUTPTR(SUCC(pred), fbp);
-        PUTPTR(SUCC(fbp), succ);
-        PUTPTR(PRED(succ), fbp);
+        void *pred = PRED(head), *succ = head;
+        PUT(PRED_OFFP(fbp), OFFSET(fbp, pred));
+        PUT(SUCC_OFFP(pred), OFFSET(pred, fbp));
+        PUT(SUCC_OFFP(fbp), OFFSET(fbp, succ));
+        PUT(PRED_OFFP(succ), OFFSET(succ, fbp));
         head = fbp;
     }
 
@@ -519,7 +525,7 @@ static void delete_fb(void *fbp) {
     // vb_printf("\tdelete_fb(%p): head = %p\n", fbp, head);
 
     if (fbp == head) {
-        if (*SUCC(fbp) == head) {
+        if (SUCC(fbp) == head) {
             head = NULL;
 
 #ifdef VERBOSE
@@ -527,12 +533,12 @@ static void delete_fb(void *fbp) {
 #endif
             return;
         }
-        head = *SUCC(fbp);
+        head = SUCC(fbp);
     }
 
-    void *pred = *PRED(fbp), *succ = *SUCC(fbp);
-    PUTPTR(SUCC(pred), succ);
-    PUTPTR(PRED(succ), pred);
+    void *pred = PRED(fbp), *succ = SUCC(fbp);
+    PUT(SUCC_OFFP(pred), OFFSET(pred, succ));
+    PUT(PRED_OFFP(succ), OFFSET(succ, pred));
 
 #ifdef VERBOSE
     vb_checklist();
@@ -555,11 +561,11 @@ static void vb_checklist(void) {
 
     dbg_printf("\t\t\tlist[0] = %p (head)\n", head);
 
-    void *ptr = *SUCC(head);
+    void *ptr = SUCC(head);
     size_t i = 1;
     while (ptr != head) {
         vb_printf("\t\t\tlist[%lu] = %p\n", i, ptr);
         ++i;
-        ptr = *SUCC(ptr);
+        ptr = SUCC(ptr);
     }
 }
