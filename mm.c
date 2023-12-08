@@ -15,7 +15,7 @@
 
 /* If you want debugging output, use the following macro.  When you hand
  * in, remove the #define DEBUG line. */
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
 # define dbg_printf(...) printf(__VA_ARGS__)
 #else
@@ -100,6 +100,7 @@ static void *find_fit(size_t asize);
 static void *coalesce(void *bp);
 static void insert_fb(void *fbp);
 static void delete_fb(void *fbp);
+static void vb_checklist(void);
 
 
 /*
@@ -107,6 +108,10 @@ static void delete_fb(void *fbp);
  */
 int mm_init(void) {
     vb_printf("mm_init(): called\n");
+
+    heap_listp = NULL;
+    epi_hdr = NULL;
+    head = NULL;
 
     heap_listp = mem_sbrk(4*WSIZE);
     if (heap_listp == (void *)-1)
@@ -127,8 +132,9 @@ int mm_init(void) {
 
     vb_printf("mm_init(): heap_listp = %p\n", heap_listp);
     vb_printf("mm_init(): epi_hdr = %p\n", epi_hdr);
+#ifdef DEBUG
     mm_checkheap(__LINE__);
-
+#endif
     vb_printf("\n");
     return 0;
 }
@@ -145,7 +151,7 @@ void *malloc(size_t size) {
     if (size == 0)
         return NULL;
     
-    size_t asize = ALIGN(size + DSIZE); /* adjust block size */
+    size_t asize = MAX(ALIGN(size + DSIZE), 3*DSIZE); /* adjust block size */
     void *bp = find_fit(asize);
 
     if (bp != NULL) { /* found */
@@ -162,7 +168,9 @@ void *malloc(size_t size) {
     }
     
     vb_printf("malloc(%#lx): will return %p\n", size, bp);
+#ifdef DEBUG
     mm_checkheap(__LINE__);
+#endif
 
     vb_printf("\n");
     return bp;
@@ -187,8 +195,9 @@ void free(void *ptr) {
     ptr = coalesce(ptr);
     insert_fb(ptr);
 
+#ifdef DEBUG
     mm_checkheap(__LINE__);
-
+#endif
     vb_printf("\n");
 }
 
@@ -330,7 +339,17 @@ void mm_checkheap(int lineno) {
     /* check cnt1-cnt2 consistency */
     if (cnt1 != cnt2) {
         dbg_printf("line %d: counts of fbs differ (%lu : %lu)\n", lineno, cnt1, cnt2);
-        exit(0);
+
+        dbg_printf("\tlist[0] = %p (head)\n", head);
+        ptr = *SUCC(head);
+        size_t i = 1;
+        while (ptr != head) {
+            dbg_printf("\tlist[%lu] = %p\n", i, ptr);
+            ++i;
+            ptr = *SUCC(ptr);
+        }
+
+        exit(1);
     }
 
 }
@@ -395,6 +414,9 @@ static void place(void *bp, size_t asize) {
 */
 static void *find_fit(size_t asize) {
     vb_printf("\tfind_fit(%#lx): head = %p\n", asize, head);
+
+    if (head == NULL)
+        return NULL;
 
     if (!GET_ALLOC(HDRP(head)) && asize <= GET_SIZE(HDRP(head)))
         return head;
@@ -469,18 +491,22 @@ static void insert_fb(void *fbp) {
         PUTPTR(PRED(fbp), fbp);
         PUTPTR(SUCC(fbp), fbp);
 
-        mm_checkheap(__LINE__);
-        return;
+    } else {
+        void *pred = *PRED(head), *succ = head;
+        PUTPTR(PRED(fbp), pred);
+        PUTPTR(SUCC(pred), fbp);
+        PUTPTR(SUCC(fbp), succ);
+        PUTPTR(PRED(succ), fbp);
+        head = fbp;
     }
 
-    void *pred = PRED(head), *succ = head;
-    PUTPTR(PRED(fbp), pred);
-    PUTPTR(SUCC(pred), fbp);
-    PUTPTR(SUCC(fbp), succ);
-    PUTPTR(PRED(succ), fbp);
-    head = fbp;
+#ifdef VERBOSE
+    vb_checklist();
+#endif
 
+#ifdef DEBUG
     mm_checkheap(__LINE__);
+#endif
 }
 
 /**
@@ -496,14 +522,44 @@ static void delete_fb(void *fbp) {
         if (*SUCC(fbp) == head) {
             head = NULL;
 
-            // mm_checkheap(__LINE__);
+#ifdef VERBOSE
+            vb_checklist();
+#endif
             return;
         }
         head = *SUCC(fbp);
     }
 
-    PUTPTR(PRED(fbp), *SUCC(fbp));
-    PUTPTR(SUCC(fbp), *PRED(fbp));
+    void *pred = *PRED(fbp), *succ = *SUCC(fbp);
+    PUTPTR(SUCC(pred), succ);
+    PUTPTR(PRED(succ), pred);
 
-    // mm_checkheap(__LINE__);
+#ifdef VERBOSE
+    vb_checklist();
+#endif
+}
+
+/**
+ * vb_checklist - print the whole list
+ * 
+ * Called by insert_fb & delete_fb
+ * when `VERBOSE` is defined.
+*/
+static void vb_checklist(void) {
+    vb_printf("\t\t\tvb_checklist(): called\n");
+
+    if (head == NULL) {
+        vb_printf("\t\t\thead = NULL\n");
+        return;
+    }
+
+    dbg_printf("\t\t\tlist[0] = %p (head)\n", head);
+
+    void *ptr = *SUCC(head);
+    size_t i = 1;
+    while (ptr != head) {
+        vb_printf("\t\t\tlist[%lu] = %p\n", i, ptr);
+        ++i;
+        ptr = *SUCC(ptr);
+    }
 }
