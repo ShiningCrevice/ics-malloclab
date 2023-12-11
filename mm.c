@@ -49,6 +49,7 @@
 #define WSIZE 4 /* Word and header/footer size (bytes) */
 #define DSIZE 8 /* Double word size (bytes) */
 #define CHUNKSIZE (1<<12) /* Extend heap by this amount (bytes) */
+#define N_SIZECLASS 12 /* number of the size classes */
 
 #define MAX(a, b) (a > b ? a : b)
 #define MIN(a, b) (a < b ? a : b)
@@ -90,16 +91,21 @@
 /* Compute the offset from fbp1 to fbp2 */
 #define OFFSET(fbp1, fbp2) ((int)((char *)(fbp2) - (char *)(fbp1)))
 
+/* Used in segretated free list */
+/* compute address of offset of the i-th size class */
+#define HEAD_OFFP(i) ((char *)(heads) + i*WSIZE)
+/* compute head ptr to the i-th size class */
+#define HEAD(i) (*(int *)(HEAD_OFFP(i)) == 0 ? NULL : (char *)(heap_listp) + *(int *)(HEAD_OFFP(i)))
+
 /* Global variables */
 /* ptr to prologue */
 static void *heap_listp = NULL;
 /* ptr to header of epilogue */
 static void *epi_hdr = NULL;
-/* header of the explicit free list */
-static void *head = NULL;
+/* ptr to heads of segretated free list */
+static void *heads = NULL;
 
 /* Helper routines */
-
 static void *extend_heap(size_t words);
 static void place(void *bp, size_t asize);
 static void *find_fit(size_t asize);
@@ -117,18 +123,24 @@ int mm_init(void) {
 
     heap_listp = NULL;
     epi_hdr = NULL;
-    head = NULL;
+    heads = NULL;
 
-    heap_listp = mem_sbrk(4*WSIZE);
-    if (heap_listp == (void *)-1)
+    int padding = N_SIZECLASS%2 ? 0 : 1;
+    heads = mem_sbrk((3 + N_SIZECLASS + padding) * WSIZE);
+    if (heads == (void *)-1)
         return -1;
     
-    PUT(heap_listp, 0);
-    PUT(heap_listp + 1 * WSIZE, PACK(DSIZE, 1)); /* prologue header */
-    PUT(heap_listp + 2 * WSIZE, PACK(DSIZE, 1)); /* prologue footer */
-    PUT(heap_listp + 3 * WSIZE, PACK(0, 1)); /* epilogue header */
+    for (int i=0; i<N_SIZECLASS; ++i)
+        PUT(HEAD_OFFP(i), 0); /* heads of size classes */
 
-    heap_listp += 2 * WSIZE; /* point to prologue */
+    heap_listp = heads + (N_SIZECLASS + padding) * WSIZE;
+    PUT(heap_listp, PACK(DSIZE, 1)); /* prologue header */
+    PUT(heap_listp + 1 * WSIZE, PACK(DSIZE, 1)); /* prologue footer */
+    PUT(heap_listp + 2 * WSIZE, PACK(0, 1)); /* epilogue header */
+
+    heap_listp += 1 * WSIZE; /* point to prologue */
+    
+    vb_printf("mm_init(): heads = %p, heap_listp = %p\n", heads, heap_listp);
 
     void *fbp = extend_heap(CHUNKSIZE / WSIZE);
     if (fbp == NULL) /* fail */
@@ -136,7 +148,6 @@ int mm_init(void) {
     /* suceed */
     insert_fb(fbp);
 
-    vb_printf("mm_init(): heap_listp = %p\n", heap_listp);
     vb_printf("mm_init(): epi_hdr = %p\n", epi_hdr);
 #ifdef DEBUG
     mm_checkheap(__LINE__);
@@ -199,6 +210,7 @@ void free(void *ptr) {
     PUT(FTRP(ptr), PACK(size, 0));
 
     ptr = coalesce(ptr);
+
     insert_fb(ptr);
 
 #ifdef DEBUG
@@ -304,26 +316,13 @@ void mm_checkheap(int lineno) {
         ptr = NEXT_BLKP(ptr);
     }
 
-    /* check each free block in list */
-    if (head != NULL) {
-        // vb_printf("\tcheck(%d): head = %p\n", lineno, head);
+    /* check each free block in each list */
+    for (int i=0; i<N_SIZECLASS; ++i) {
+        void *head = HEAD(i);
+        if (head != NULL) {
+            // vb_printf("\tcheck(%d): head = %p\n", lineno, head);
 
-        ptr = head;
-        ++cnt2;
-        if (!in_heap(ptr)) {
-            dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
-            exit(1);
-        }
-        if (SUCC(PRED(ptr)) != ptr) {
-            dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
-            exit(1);
-        }
-        if (PRED(SUCC(ptr)) != ptr) {
-            dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
-            exit(1);
-        }
-        ptr = SUCC(ptr);
-        while (ptr != head) {
+            ptr = head;
             ++cnt2;
             if (!in_heap(ptr)) {
                 dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
@@ -337,24 +336,30 @@ void mm_checkheap(int lineno) {
                 dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
                 exit(1);
             }
-
             ptr = SUCC(ptr);
+            while (ptr != head) {
+                ++cnt2;
+                if (!in_heap(ptr)) {
+                    dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
+                    exit(1);
+                }
+                if (SUCC(PRED(ptr)) != ptr) {
+                    dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
+                    exit(1);
+                }
+                if (PRED(SUCC(ptr)) != ptr) {
+                    dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
+                    exit(1);
+                }
+
+                ptr = SUCC(ptr);
+            }
         }
     }
 
     /* check cnt1-cnt2 consistency */
     if (cnt1 != cnt2) {
         dbg_printf("line %d: counts of fbs differ (%lu : %lu)\n", lineno, cnt1, cnt2);
-
-        dbg_printf("\tlist[0] = %p (head)\n", head);
-        ptr = SUCC(head);
-        size_t i = 1;
-        while (ptr != head) {
-            dbg_printf("\tlist[%lu] = %p\n", i, ptr);
-            ++i;
-            ptr = SUCC(ptr);
-        }
-
         exit(1);
     }
 
@@ -392,17 +397,19 @@ static void *extend_heap(size_t words) {
 /**
  * place - allocate a block
  * 
- * WILL update the explicit free list
+ * WILL update the free block lists
 */
 static void place(void *bp, size_t asize) {
     vb_printf("\tplace(%p, %#lx): called\n", bp, asize);
 
     size_t csize = GET_SIZE(HDRP(bp));
+
     delete_fb(bp);
 
-    if ((csize - asize) >= (3*DSIZE)) { /* split */
+    if ((csize - asize) >= (2*DSIZE)) { /* split */
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
+
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(csize-asize, 0));
         PUT(FTRP(bp), PACK(csize-asize, 0));
@@ -416,28 +423,44 @@ static void place(void *bp, size_t asize) {
 }
 
 /**
- * find_fit - first-fit, explicit free list
+ * find_fit - first-fit, segretated free list
 */
 static void *find_fit(size_t asize) {
-    vb_printf("\tfind_fit(%#lx): head = %p\n", asize, head);
+    int i = 0;
+    size_t ruler = 2 * DSIZE;
+    while (i < N_SIZECLASS-1 && asize > ruler) {
+        ++i;
+        ruler <<= 1;
+    }
+    void *head;
 
-    if (head == NULL)
-        return NULL;
+    // vb_printf("\tfind_fit(%#lx): head = %p\n", asize, head);
 
-    if (!GET_ALLOC(HDRP(head)) && asize <= GET_SIZE(HDRP(head)))
-        return head;
-    void *fbp = SUCC(head);
-    while (fbp != head) {
-        if (!GET_ALLOC(HDRP(fbp)) && asize <= GET_SIZE(HDRP(fbp)))
-            return fbp;
-        fbp = SUCC(fbp);
+    while (i < N_SIZECLASS) {
+        head = HEAD(i);
+
+        if (head == NULL) {
+            ++i;
+            continue;
+        }
+
+        if (!GET_ALLOC(HDRP(head)) && asize <= GET_SIZE(HDRP(head)))
+            return head;
+
+        void *fbp = SUCC(head);
+        while (fbp != head) {
+            if (!GET_ALLOC(HDRP(fbp)) && asize <= GET_SIZE(HDRP(fbp)))
+                return fbp;
+            fbp = SUCC(fbp);
+        }
+
+        ++i;
     }
 
     /* not found */
     vb_printf("\tfind_fit(%#lx): not found\n", asize);
     return NULL;
 }
-
 
 /**
  * coalesce - coalesce the prev/next blocks if possible
@@ -490,24 +513,35 @@ static void *coalesce(void *bp) {
  * insert_fb - insert a free block at head
 */
 static void insert_fb(void *fbp) {
-    vb_printf("\t\tinsert_fb(%p): called\n", fbp);
+
+    size_t size = GET_SIZE(HDRP(fbp));
+    int i = 0;
+    size_t ruler = 2 * DSIZE;
+    while (i < N_SIZECLASS-1 && size > ruler) {
+        ++i;
+        ruler <<= 1;
+    }
+    void *head = HEAD(i);
+
+    vb_printf("\t\tinsert_fb(%p): size = %#lx, head[%d] = %p\n", fbp, size, i, head);
 
     if (head == NULL) {
-        head = fbp;
+        // head = fbp;
+        PUT(HEAD_OFFP(i), OFFSET(heap_listp, fbp));
         PUT(PRED_OFFP(fbp), 0);
         PUT(SUCC_OFFP(fbp), 0);
 
     } else {
+        /* insert to tail of list */
         void *pred = PRED(head), *succ = head;
         PUT(PRED_OFFP(fbp), OFFSET(fbp, pred));
         PUT(SUCC_OFFP(pred), OFFSET(pred, fbp));
         PUT(SUCC_OFFP(fbp), OFFSET(fbp, succ));
         PUT(PRED_OFFP(succ), OFFSET(succ, fbp));
-        head = fbp;
     }
 
 #ifdef VERBOSE
-    vb_checklist();
+    // vb_checklist();
 #endif
 
 #ifdef DEBUG
@@ -521,19 +555,30 @@ static void insert_fb(void *fbp) {
  * Usually called when the block is coalesced.
 */
 static void delete_fb(void *fbp) {
-    vb_printf("\t\tdelete_fb(%p): called\n", fbp);
-    // vb_printf("\tdelete_fb(%p): head = %p\n", fbp, head);
+    size_t size = GET_SIZE(HDRP(fbp));
+    int i = 0;
+    size_t ruler = 2 * DSIZE;
+    while (i < N_SIZECLASS-1 && size > ruler) {
+        ++i;
+        ruler <<= 1;
+    }
+    void *head = HEAD(i);
+
+    vb_printf("\t\tdelete_fb(%p): size = %#lx, head[%d] = %p\n", fbp, size, i, head);
 
     if (fbp == head) {
         if (SUCC(fbp) == head) {
-            head = NULL;
+            // head = NULL;
+            PUT(HEAD_OFFP(i), 0);
 
 #ifdef VERBOSE
-            vb_checklist();
+            // vb_checklist();
 #endif
             return;
         }
-        head = SUCC(fbp);
+
+        // head = SUCC(fbp);
+        PUT(HEAD_OFFP(i), OFFSET(heap_listp, SUCC(fbp)));
     }
 
     void *pred = PRED(fbp), *succ = SUCC(fbp);
@@ -541,31 +586,34 @@ static void delete_fb(void *fbp) {
     PUT(PRED_OFFP(succ), OFFSET(succ, pred));
 
 #ifdef VERBOSE
-    vb_checklist();
+    // vb_checklist();
 #endif
 }
 
 /**
  * vb_checklist - print the whole list
  * 
- * Called by insert_fb & delete_fb
- * when `VERBOSE` is defined.
+ * Called by insert_fb & delete_fb when `VERBOSE` is defined.
 */
 static void vb_checklist(void) {
     vb_printf("\t\t\tvb_checklist(): called\n");
 
-    if (head == NULL) {
-        vb_printf("\t\t\thead = NULL\n");
-        return;
-    }
+    for (int i=0; i<N_SIZECLASS; ++i) {
+        void *head = HEAD(i);
 
-    dbg_printf("\t\t\tlist[0] = %p (head)\n", head);
+        if (head == NULL) {
+            vb_printf("\t\t\thead[%d] = NULL\n", i);
+            return;
+        }
 
-    void *ptr = SUCC(head);
-    size_t i = 1;
-    while (ptr != head) {
-        vb_printf("\t\t\tlist[%lu] = %p\n", i, ptr);
-        ++i;
-        ptr = SUCC(ptr);
+        vb_printf("\t\t\tlist[%d][0] = %p (head)\n", i, head);
+
+        void *ptr = SUCC(head);
+        size_t j = 1;
+        while (ptr != head) {
+            vb_printf("\t\t\tlist[%d][%lu] = %p\n", i, j, ptr);
+            ++j;
+            ptr = SUCC(ptr);
+        }
     }
 }
