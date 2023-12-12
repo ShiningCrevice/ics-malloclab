@@ -58,16 +58,16 @@
 #define GET(p) (*(unsigned int *)(p))
 /* Write a word at address p */
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
-/* Write a ptr at address p */
-// #define PUTPTR(p, ptr) (*(void **)(p) = (ptr))
 
-/* Pack a size and allocated bit into a word */
-#define PACK(size, alloc) ((size) | (alloc))
+/* Pack a size and allocated bits into a word */
+/* `palloc` - prev block's alloc */
+#define PACK(size, alloc, palloc) ((size) | (alloc) | (palloc))
 
 /* Read the size from address p */
 #define GET_SIZE(p)  (GET(p) & ~0x7)
 /* Read allocated fields from address p */
 #define GET_ALLOC(p) (GET(p) & 0x1)
+#define GET_PALLOC(p) (GET(p) & 0x2)
 
 /* Given block ptr bp, compute address of its header */
 #define HDRP(bp) ((char *)(bp) - WSIZE)
@@ -106,7 +106,7 @@ static void *epi_hdr = NULL;
 static void *heads = NULL;
 
 /* Helper routines */
-static void *extend_heap(size_t words);
+static void *extend_heap(size_t words, int palloc);
 static void place(void *bp, size_t asize);
 static void *find_fit(size_t asize);
 static void *coalesce(void *bp);
@@ -134,15 +134,17 @@ int mm_init(void) {
         PUT(HEAD_OFFP(i), 0); /* heads of size classes */
 
     heap_listp = heads + (N_SIZECLASS + padding) * WSIZE;
-    PUT(heap_listp, PACK(DSIZE, 1)); /* prologue header */
-    PUT(heap_listp + 1 * WSIZE, PACK(DSIZE, 1)); /* prologue footer */
-    PUT(heap_listp + 2 * WSIZE, PACK(0, 1)); /* epilogue header */
+    if (padding)
+        PUT(heap_listp - 1 * WSIZE, 0);
+    PUT(heap_listp, PACK(DSIZE, 1, 2)); /* prologue header */
+    PUT(heap_listp + 1 * WSIZE, 0); /* prologue padding */
+    PUT(heap_listp + 2 * WSIZE, PACK(0, 1, 2)); /* epilogue header */
 
     heap_listp += 1 * WSIZE; /* point to prologue */
     
     vb_printf("mm_init(): heads = %p, heap_listp = %p\n", heads, heap_listp);
 
-    void *fbp = extend_heap(CHUNKSIZE / WSIZE);
+    void *fbp = extend_heap(CHUNKSIZE / WSIZE, 2);
     if (fbp == NULL) /* fail */
         return -1;
     /* suceed */
@@ -168,14 +170,15 @@ void *malloc(size_t size) {
     if (size == 0)
         return NULL;
     
-    size_t asize = MAX(ALIGN(size + DSIZE), 2*DSIZE); /* adjust block size */
+    size_t asize = MAX(ALIGN(size + WSIZE), 2*DSIZE); /* adjust block size */
     void *bp = find_fit(asize);
 
     if (bp != NULL) { /* found */
         place(bp, asize);
     } else { /* not found, extend heap */
         size_t esize = MAX(asize, CHUNKSIZE); /* size to extend */
-        bp = extend_heap(esize / WSIZE);
+        int epalloc = GET_PALLOC(epi_hdr);
+        bp = extend_heap(esize / WSIZE, epalloc);
         if (bp == NULL) /* fail */
             return NULL;
 
@@ -206,8 +209,13 @@ void free(void *ptr) {
         mem_init();
 
     size_t size = GET_SIZE(HDRP(ptr));
-    PUT(HDRP(ptr), PACK(size, 0));
-    PUT(FTRP(ptr), PACK(size, 0));
+    int palloc = GET_PALLOC(HDRP(ptr));
+    PUT(HDRP(ptr), PACK(size, 0, palloc));
+    PUT(FTRP(ptr), PACK(size, 0, palloc));
+
+    size_t nsize = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    int nalloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(nsize, nalloc, 0));
 
     ptr = coalesce(ptr);
 
@@ -279,12 +287,13 @@ void mm_checkheap(int lineno) {
     // vb_printf("\tcheck(%d): called\n", lineno);
 
     /* check prologue and epilogue blocks */
-    if (!in_heap(heap_listp) ||
-        *(unsigned long *)HDRP(heap_listp) != 0x900000009ul) {
+    if (!in_heap(heap_listp) || GET_ALLOC(HDRP(heap_listp)) != 1 || 
+        GET_SIZE(HDRP(heap_listp)) != DSIZE || GET_PALLOC(HDRP(heap_listp)) != 2) {
         dbg_printf("line %d: prologue error\n", lineno);
         exit(1);
     }
-    if (!in_heap(epi_hdr) || *(unsigned int *)(epi_hdr) != 1) {
+    if (!in_heap(epi_hdr) || GET_ALLOC(epi_hdr) != 1 || 
+        GET_SIZE(epi_hdr) != 0) {
         dbg_printf("line %d: epilogue error\n", lineno);
         exit(1);
     }
@@ -302,7 +311,7 @@ void mm_checkheap(int lineno) {
             dbg_printf("line %d: block %p not aligned\n", lineno, ptr);
             exit(1);
         }
-        if (*(unsigned int *)(HDRP(ptr)) != *(unsigned int *)(FTRP(ptr))) {
+        if (GET_ALLOC(HDRP(ptr)) == 0 && *(unsigned int *)(HDRP(ptr)) != *(unsigned int *)(FTRP(ptr))) {
             dbg_printf("line %d: block %p head-foot inconsistent\n"
                 "\tblock %p: head: %#x foot: %#x\n", lineno, ptr, ptr, 
                 *(unsigned int *)(HDRP(ptr)), *(unsigned int *)(FTRP(ptr)));
@@ -310,6 +319,10 @@ void mm_checkheap(int lineno) {
         }
         if (GET_ALLOC(HDRP(ptr)) == 0 && GET_ALLOC(HDRP(NEXT_BLKP(ptr))) == 0) {
             dbg_printf("line %d: block %p & %p not coalensced\n", lineno, ptr, NEXT_BLKP(ptr));
+            exit(1);
+        }
+        if (!GET_ALLOC(HDRP(ptr)) != !GET_PALLOC(HDRP(NEXT_BLKP(ptr)))) {
+            dbg_printf("line %d: block %p & %p header inconsistent\n", lineno, ptr, NEXT_BLKP(ptr));
             exit(1);
         }
 
@@ -377,17 +390,17 @@ void mm_checkheap(int lineno) {
  * 
  * NOT add the extended block to list yet.
 */
-static void *extend_heap(size_t words) {
+static void *extend_heap(size_t words, int palloc) {
     size_t size = (words%2 ? words+1 : words) * WSIZE;
 
     void *bp = mem_sbrk(size);
     if (bp == (void *)-1)
         return NULL;
 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(bp), PACK(size, 0, palloc));
+    PUT(FTRP(bp), PACK(size, 0, palloc));
     epi_hdr = HDRP(NEXT_BLKP(bp));
-    PUT(epi_hdr, PACK(0, 1)); /* new epilogue header */
+    PUT(epi_hdr, PACK(0, 1, 0)); /* new epilogue header */
 
     vb_printf("\textend_heap(%#lx): epi_hdr = %p\n", words, epi_hdr);
 
@@ -403,22 +416,25 @@ static void place(void *bp, size_t asize) {
     vb_printf("\tplace(%p, %#lx): called\n", bp, asize);
 
     size_t csize = GET_SIZE(HDRP(bp));
+    // int palloc = GET_PALLOC(HDRP(bp));
 
     delete_fb(bp);
 
     if ((csize - asize) >= (2*DSIZE)) { /* split */
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
+        PUT(HDRP(bp), PACK(asize, 1, 2));
+        // PUT(FTRP(bp), PACK(asize, 1));
 
         bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize-asize, 0));
-        PUT(FTRP(bp), PACK(csize-asize, 0));
+        PUT(HDRP(bp), PACK(csize-asize, 0, 2));
+        PUT(FTRP(bp), PACK(csize-asize, 0, 2));
 
         insert_fb(bp);
         
     } else { /* no split */
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
+        PUT(HDRP(bp), PACK(csize, 1, 2));
+        // PUT(FTRP(bp), PACK(csize, 1));
+        size_t nsize = GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(nsize, 1, 2));
     }
 }
 
@@ -465,10 +481,11 @@ static void *find_fit(size_t asize) {
 /**
  * coalesce - coalesce the prev/next blocks if possible
  * 
- * WILL delete the coalesced blocks from the list
+ * WILL delete the coalesced blocks from the list.
+ * NOT add the new block to the list yet.
 */
 static void *coalesce(void *bp) {
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    size_t prev_alloc = GET_PALLOC(HDRP(bp));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
@@ -480,16 +497,17 @@ static void *coalesce(void *bp) {
 
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         delete_fb(NEXT_BLKP(bp));
-        PUT(HDRP(bp), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size,0));
+        PUT(HDRP(bp), PACK(size, 0, prev_alloc));
+        PUT(FTRP(bp), PACK(size, 0, prev_alloc));
 
     } else if (!prev_alloc && next_alloc) {      /* Case 3 */
         vb_printf("\tcoalesce(%p): will coalesce prev\n", bp);
         
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        int ppalloc = GET_PALLOC(HDRP(PREV_BLKP(bp)));
         delete_fb(PREV_BLKP(bp));
-        PUT(FTRP(bp), PACK(size, 0));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0, ppalloc));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0, ppalloc));
 
         bp = PREV_BLKP(bp);
 
@@ -498,10 +516,11 @@ static void *coalesce(void *bp) {
         
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + 
             GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        int ppalloc = GET_PALLOC(HDRP(PREV_BLKP(bp)));
         delete_fb(PREV_BLKP(bp));
         delete_fb(NEXT_BLKP(bp));
-        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0, ppalloc));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0, ppalloc));
 
         bp = PREV_BLKP(bp);
     }
