@@ -1,8 +1,23 @@
 /*
  * mm.c
  *
- * NOTE TO STUDENTS: Replace this header comment with your own header
- * comment that gives a high level description of your solution.
+ * 李奕成 2200013150
+ * 
+ * 本文件即是 malloc lab 说明文档要求提交的 `mm.c`.
+ * 
+ * 此内存分配器采用 分离适配(segregated fit), 首次适配(first fit).
+ * 优化: 对已分配块去脚部; 堆中使用偏移量替代指针; 新空闲块插入表尾.
+ * 
+ * 共有13个大小类 (0~12),
+ * 第i个类中的块大小属于 (16 * 2^(i-1), 16 * 2^i]
+ * (第0个类没有下界, 第12个类没有上界).
+ * 每个类是一个双向循环链表,
+ * 第一个块的相对序言块的偏移量(4 Bytes)都存储在序言块前的表中,
+ * 若该类为空则偏移量为0. 该表由指针 `heads` 指向.
+ * 表中的每个空闲块都存储着其祖先/后继相对于自己的偏移量(4 Bytes).
+ * 
+ * 每个块的头部中, 用第二低位存储前一个块是否已分配,
+ * 从而实现已分配块不需要脚部.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -37,7 +52,7 @@
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(p) (((size_t)(p) + (ALIGNMENT-1)) & ~0x7)
 
-
+/* `VERBOSE` is defined to show more verbose tails for debugging */
 // #define VERBOSE
 #ifdef VERBOSE
 # define vb_printf(...) printf(__VA_ARGS__)
@@ -49,7 +64,7 @@
 #define WSIZE 4 /* Word and header/footer size (bytes) */
 #define DSIZE 8 /* Double word size (bytes) */
 #define CHUNKSIZE (1<<12) /* Extend heap by this amount (bytes) */
-#define N_SIZECLASS 12 /* number of the size classes */
+#define N_SIZECLASS 13 /* number of the size classes */
 
 #define MAX(a, b) (a > b ? a : b)
 #define MIN(a, b) (a < b ? a : b)
@@ -116,7 +131,8 @@ static void vb_checklist(void);
 
 
 /*
- * Initialize: return -1 on error, 0 on success.
+ * mm_init - initialize the memory
+ * return -1 on error, 0 on success.
  */
 int mm_init(void) {
     vb_printf("mm_init(): called\n");
@@ -125,7 +141,7 @@ int mm_init(void) {
     epi_hdr = NULL;
     heads = NULL;
 
-    int padding = N_SIZECLASS%2 ? 0 : 1;
+    int padding = N_SIZECLASS%2 ? 0 : 1; /* padding for alignment */
     heads = mem_sbrk((3 + N_SIZECLASS + padding) * WSIZE);
     if (heads == (void *)-1)
         return -1;
@@ -159,7 +175,7 @@ int mm_init(void) {
 }
 
 /*
- * malloc
+ * malloc - allocate the memory of `size` bytes
  */
 void *malloc(size_t size) {
     vb_printf("malloc(%#lx): called\n", size);
@@ -188,6 +204,7 @@ void *malloc(size_t size) {
     }
     
     vb_printf("malloc(%#lx): will return %p\n", size, bp);
+
 #ifdef DEBUG
     mm_checkheap(__LINE__);
 #endif
@@ -197,7 +214,7 @@ void *malloc(size_t size) {
 }
 
 /*
- * free - using LIFO order
+ * free - free the memory pointed to by `ptr`
  */
 void free(void *ptr) {
     vb_printf("free(%p): called\n", ptr);
@@ -213,6 +230,7 @@ void free(void *ptr) {
     PUT(HDRP(ptr), PACK(size, 0, palloc));
     PUT(FTRP(ptr), PACK(size, 0, palloc));
 
+    /* change the palloc bit of the next block */
     size_t nsize = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
     int nalloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     PUT(HDRP(NEXT_BLKP(ptr)), PACK(nsize, nalloc, 0));
@@ -228,7 +246,11 @@ void free(void *ptr) {
 }
 
 /*
- * realloc - naive version
+ * realloc - reallocte the memory pointed to by `oldptr`
+ * 
+ * It's a naive version.
+ * Simply allocate a new area and copy the old memory there,
+ * and then free the old pointer.
  */
 void *realloc(void *oldptr, size_t size) {
     if (size == 0) {
@@ -252,7 +274,9 @@ void *realloc(void *oldptr, size_t size) {
 }
 
 /*
- * calloc - naive version
+ * calloc - malloc & set the memory all-zero
+ * 
+ * It's a naive version.
  */
 void *calloc (size_t nmemb, size_t size) {
     size_t bytes = nmemb * size;
@@ -281,11 +305,11 @@ static int aligned(const void *p) {
 }
 
 /*
- * mm_checkheap
+ * mm_checkheap - check almost everything
+ * 
+ * Used in dubugging.
  */
 void mm_checkheap(int lineno) {
-    // vb_printf("\tcheck(%d): called\n", lineno);
-
     /* check prologue and epilogue blocks */
     if (!in_heap(heap_listp) || GET_ALLOC(HDRP(heap_listp)) != 1 || 
         GET_SIZE(HDRP(heap_listp)) != DSIZE || GET_PALLOC(HDRP(heap_listp)) != 2) {
@@ -298,7 +322,7 @@ void mm_checkheap(int lineno) {
         exit(1);
     }
 
-    /* count free blocks by 2 ways */
+    /* count free blocks in 2 ways */
     size_t cnt1 = 0, cnt2 = 0;
 
     /* check each block by address order */
@@ -307,20 +331,27 @@ void mm_checkheap(int lineno) {
         if (GET_ALLOC(HDRP(ptr)) == 0)
             ++cnt1;
         
+        /* check the alignment */
         if (!aligned(ptr)) {
             dbg_printf("line %d: block %p not aligned\n", lineno, ptr);
             exit(1);
         }
+
+        /* check if the header and footer is consistent */
         if (GET_ALLOC(HDRP(ptr)) == 0 && *(unsigned int *)(HDRP(ptr)) != *(unsigned int *)(FTRP(ptr))) {
             dbg_printf("line %d: block %p head-foot inconsistent\n"
                 "\tblock %p: head: %#x foot: %#x\n", lineno, ptr, ptr, 
                 *(unsigned int *)(HDRP(ptr)), *(unsigned int *)(FTRP(ptr)));
             exit(1);
         }
+
+        /* check if there are 2 neighboring free blocks not coalensced */
         if (GET_ALLOC(HDRP(ptr)) == 0 && GET_ALLOC(HDRP(NEXT_BLKP(ptr))) == 0) {
             dbg_printf("line %d: block %p & %p not coalensced\n", lineno, ptr, NEXT_BLKP(ptr));
             exit(1);
         }
+
+        /* check if the alloc-bit and the palloc-bit of the next block is consistent */
         if (!GET_ALLOC(HDRP(ptr)) != !GET_PALLOC(HDRP(NEXT_BLKP(ptr)))) {
             dbg_printf("line %d: block %p & %p header inconsistent\n", lineno, ptr, NEXT_BLKP(ptr));
             exit(1);
@@ -337,10 +368,14 @@ void mm_checkheap(int lineno) {
 
             ptr = head;
             ++cnt2;
+
+            /* check if this ptr is in heap */
             if (!in_heap(ptr)) {
                 dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
                 exit(1);
             }
+
+            /* check the consistency of succ-prev pairs */
             if (SUCC(PRED(ptr)) != ptr) {
                 dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
                 exit(1);
@@ -349,13 +384,18 @@ void mm_checkheap(int lineno) {
                 dbg_printf("line %d: fb %p not matching its succ\n", lineno, ptr);
                 exit(1);
             }
+
             ptr = SUCC(ptr);
             while (ptr != head) {
                 ++cnt2;
+
+                /* check if this ptr is in heap */
                 if (!in_heap(ptr)) {
                     dbg_printf("line %d: fb %p not in heap\n", lineno, ptr);
                     exit(1);
                 }
+                
+                /* check the consistency of succ-prev pairs */
                 if (SUCC(PRED(ptr)) != ptr) {
                     dbg_printf("line %d: fb %p not matching its pred\n", lineno, ptr);
                     exit(1);
@@ -422,7 +462,6 @@ static void place(void *bp, size_t asize) {
 
     if ((csize - asize) >= (2*DSIZE)) { /* split */
         PUT(HDRP(bp), PACK(asize, 1, 2));
-        // PUT(FTRP(bp), PACK(asize, 1));
 
         bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(csize-asize, 0, 2));
@@ -432,14 +471,15 @@ static void place(void *bp, size_t asize) {
         
     } else { /* no split */
         PUT(HDRP(bp), PACK(csize, 1, 2));
-        // PUT(FTRP(bp), PACK(csize, 1));
         size_t nsize = GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(NEXT_BLKP(bp)), PACK(nsize, 1, 2));
     }
 }
 
 /**
- * find_fit - first-fit, segretated free list
+ * find_fit - find a proper free block to allocate
+ * 
+ * Use first-fit for  segretated free list.
 */
 static void *find_fit(size_t asize) {
     int i = 0;
@@ -449,8 +489,6 @@ static void *find_fit(size_t asize) {
         ruler <<= 1;
     }
     void *head;
-
-    // vb_printf("\tfind_fit(%#lx): head = %p\n", asize, head);
 
     while (i < N_SIZECLASS) {
         head = HEAD(i);
@@ -529,7 +567,7 @@ static void *coalesce(void *bp) {
 }
 
 /**
- * insert_fb - insert a free block at head
+ * insert_fb - insert a free block to tail of list
 */
 static void insert_fb(void *fbp) {
 
@@ -545,7 +583,6 @@ static void insert_fb(void *fbp) {
     vb_printf("\t\tinsert_fb(%p): size = %#lx, head[%d] = %p\n", fbp, size, i, head);
 
     if (head == NULL) {
-        // head = fbp;
         PUT(HEAD_OFFP(i), OFFSET(heap_listp, fbp));
         PUT(PRED_OFFP(fbp), 0);
         PUT(SUCC_OFFP(fbp), 0);
@@ -559,10 +596,6 @@ static void insert_fb(void *fbp) {
         PUT(PRED_OFFP(succ), OFFSET(succ, fbp));
     }
 
-#ifdef VERBOSE
-    // vb_checklist();
-#endif
-
 #ifdef DEBUG
     mm_checkheap(__LINE__);
 #endif
@@ -570,8 +603,6 @@ static void insert_fb(void *fbp) {
 
 /**
  * delete_fb - delete a free block from list
- * 
- * Usually called when the block is coalesced.
 */
 static void delete_fb(void *fbp) {
     size_t size = GET_SIZE(HDRP(fbp));
@@ -587,52 +618,14 @@ static void delete_fb(void *fbp) {
 
     if (fbp == head) {
         if (SUCC(fbp) == head) {
-            // head = NULL;
             PUT(HEAD_OFFP(i), 0);
-
-#ifdef VERBOSE
-            // vb_checklist();
-#endif
             return;
         }
 
-        // head = SUCC(fbp);
         PUT(HEAD_OFFP(i), OFFSET(heap_listp, SUCC(fbp)));
     }
 
     void *pred = PRED(fbp), *succ = SUCC(fbp);
     PUT(SUCC_OFFP(pred), OFFSET(pred, succ));
     PUT(PRED_OFFP(succ), OFFSET(succ, pred));
-
-#ifdef VERBOSE
-    // vb_checklist();
-#endif
-}
-
-/**
- * vb_checklist - print the whole list
- * 
- * Called by insert_fb & delete_fb when `VERBOSE` is defined.
-*/
-static void vb_checklist(void) {
-    vb_printf("\t\t\tvb_checklist(): called\n");
-
-    for (int i=0; i<N_SIZECLASS; ++i) {
-        void *head = HEAD(i);
-
-        if (head == NULL) {
-            vb_printf("\t\t\thead[%d] = NULL\n", i);
-            return;
-        }
-
-        vb_printf("\t\t\tlist[%d][0] = %p (head)\n", i, head);
-
-        void *ptr = SUCC(head);
-        size_t j = 1;
-        while (ptr != head) {
-            vb_printf("\t\t\tlist[%d][%lu] = %p\n", i, j, ptr);
-            ++j;
-            ptr = SUCC(ptr);
-        }
-    }
 }
